@@ -112,6 +112,7 @@ The plugin adds a `straiker` block to the log record Kong's log-serializing plug
 - **A blocked prompt has no `response` entry**: the model was never called.
 - **A `degraded` phase carries only `action`.** Why it degraded is in the plugin's error-log line, `[straiker] request scoring failed: <reason>`.
 
+- **A handler delivered by the control plane omits empty lists.** `"blocked_by": []` is simply absent there, because the sandbox has no way to mark an empty table as a list. See [What the sandbox withholds](#what-the-sandbox-withholds).
 - **`streaming` mode records the prompt only.** The answer is scored after the response has been sent and logged, so a blocked answer is reported in the plugin's own log line instead: `[straiker] relay verdict was BLOCK but the answer had already streamed: <controls> (turn <turn_id>)`.
 - **The provider credential is masked.** The plugin injects `upstream_api_key` as a request header, and the record copies request headers, so the plugin replaces that header's value in the record with `REDACTED`.
 
@@ -278,6 +279,8 @@ At 1000 the failure is silent: the `response` phase never runs, the client still
 
 A non-streaming client was never affected either way: the clear is conditional on stream mode.
 
+**Kong AI Gateway 2.x.** From 2.2 the runtime no longer clears buffering inside the AI proxy's own access handler. It defers the clear to a pipeline flush that runs once iteration drops below the lowest AI plugin priority (765 in 2.2.0), which is after this plugin has been collected. Collection order alone therefore stopped working there: on 0.13.0 a streamed request behind an AI proxy or a Model was answered with `x-straiker-verdict: allow` and the answer was never scored. From 0.14.0, in `buffered` mode the plugin also calls `kong.service.request.enable_buffering()` at the start of its access handler, which runs after that flush. Its priority still has to stay below every AI plugin on the route for this to hold.
+
 ---
 
 ## Point Claude Code at Kong
@@ -304,7 +307,7 @@ The plugin is exactly one `handler.lua` and one `schema.lua`, with no sibling mo
 
 Prerequisites:
 
-- Kong Gateway 3.14 or later.
+- Kong Gateway 3.14 or later, or Kong AI Gateway 2.2 or later. On AI Gateway 2.x, `buffered` mode needs plugin 0.14.0 or later.
 - A Straiker account and an integration key (`sk_agt_…`).
 - Network egress from Kong data planes to Straiker.
 - `nginx_http_client_body_buffer_size` raised — see [Body buffer](#body-buffer-required).
@@ -336,7 +339,7 @@ docker build -f Dockerfile.konnect -t kong-straiker:latest .
 ### LuaRocks
 
 ```sh
-luarocks make kong-plugin-straiker-0.13.0-1.rockspec
+luarocks make kong-plugin-straiker-0.14.0-1.rockspec
 export KONG_PLUGINS=bundled,straiker
 kong reload
 ```
@@ -344,7 +347,7 @@ kong reload
 From a release (when published):
 
 ```sh
-luarocks install https://github.com/straiker-ai/kong/releases/download/v0.13.0/kong-plugin-straiker-0.13.0-1.all.rock
+luarocks install https://github.com/straiker-ai/kong/releases/download/v0.14.0/kong-plugin-straiker-0.14.0-1.all.rock
 ```
 
 ### Konnect hybrid
@@ -387,6 +390,7 @@ What Kong enforces on a streamed plugin, and what it means here:
 | 100 KB per file | Met. The handler is ~39 KB, the schema ~11 KB |
 | `require` is gated by `KONG_UNTRUSTED_LUA` | **The one setting that matters.** The handler needs `resty.http` and `cjson.safe`. See below |
 | Cannot create timers | Only relevant in `streaming` mode. See [Response relay and timers](#response-relay-and-timers) |
+| `os.getenv` and `setmetatable` are not in the sandbox | Handled from 0.14.0. See [What the sandbox withholds](#what-the-sandbox-withholds) |
 | No filesystem reads or writes | Met. The plugin never touches the filesystem |
 
 There is no versioning for a streamed plugin. To change one, upload it under a new name, move the plugin instances to it, then delete the old one.
@@ -405,11 +409,23 @@ A streamed handler's `require` runs inside Kong's sandbox, and the mode is set b
 
 **Prefer `lax` over `on`.** Both load this plugin, but the setting is gateway-wide: `on` removes the sandbox for *every* custom plugin on that gateway, including any added later by someone else.
 
+#### What the sandbox withholds
+
+A handler delivered by the control plane runs inside Kong's plugin sandbox, which is an allowlist. Measured on Kong AI Gateway 2.3.1 with `KONG_UNTRUSTED_LUA=lax`, three things this plugin used are not on it. Before 0.14.0 the first stopped the handler loading at all, which rejected the whole config and left the route answering 404, and the second failed every request with a 500.
+
+| Withheld | What the plugin does from 0.14.0 |
+| --- | --- |
+| `os.getenv` | Reads `STRAIKER_KONG_MODE` through Kong's `env` vault instead. A delivered handler is loaded in the worker, whose environment nginx clears, so name the variable in `KONG_NGINX_MAIN_ENV` as well. With neither source the mode is `buffered` |
+| `setmetatable` | Leaves an empty list out of the [log record](#the-log-record) rather than writing it as `{}`. An installed copy still writes `[]` |
+| `ngx.timer` | In `streaming` mode, skips the answer relay and logs one warning per worker. See below |
+
+An installed copy (rock, image or mounted directory) is not sandboxed and is unaffected.
+
 #### Response relay and timers
 
-Kong documents that a streamed plugin "cannot run in the `init_worker` phase or create timers". In `streaming` mode the plugin relays the model's answer from `ngx.timer.at`, because `log_by_lua` forbids cosockets and `resty.http` is built on them — there is no other way to make that call once the bytes have shipped.
+Kong documents that a streamed plugin "cannot run in the `init_worker` phase or create timers". In `streaming` mode the plugin relays the model's answer from `ngx.timer.at`, because `log_by_lua` forbids cosockets and `resty.http` is built on them. There is no other way to make that call once the bytes have shipped.
 
-In practice the sandbox does not block it: Kong's own `kong/tools/sandbox/configuration.lua` hands the plugin the entire `ngx` global in every mode. Treat the restriction as Kong asking you not to rather than as something that will fail. `buffered` mode needs no timer at all.
+Whether the timer is available depends on the runtime, so the plugin checks when it loads. On Kong AI Gateway 2.3.1 a delivered handler has no `ngx.timer`: `streaming` mode then enforces prompts and tool results as usual but **cannot score answers at all**, and says so once per worker in the Kong log. Before 0.14.0 that case raised in the log phase on every request. Where the timer is available the relay runs as described. `buffered` mode needs no timer and is the mode to use for a delivered handler.
 
 ---
 
@@ -435,6 +451,14 @@ curl -i -X POST http://localhost:8000/v1/messages \
 You want HTTP 200 and `x-straiker-verdict: allow`. Keep `max_tokens` generous while testing: a reply truncated at `stop_reason: max_tokens` looks like a block at a glance.
 
 ---
+
+## Upgrading from 0.13.0
+
+No config changes.
+
+- **`buffered` mode now holds streamed answers on Kong AI Gateway 2.2 and later.** On 0.13.0 a streamed request behind a Model or an AI proxy was passed through with `x-straiker-verdict: allow` and the answer was never scored. See [AI Proxy](#ai-proxy). On those routes the time to first token becomes the completion time, as it already is on Kong Gateway 3.x.
+- **The plugin now runs as a handler delivered by the control plane**, such as a Konnect custom policy of type `streaming`. On 0.13.0 it failed to load there, and once loaded it failed every request. See [What the sandbox withholds](#what-the-sandbox-withholds).
+- **Kong Gateway 3.x with an installed plugin is unchanged.**
 
 ## Upgrading from 0.12.x
 
@@ -521,6 +545,7 @@ A system prompt only names a client Straiker has a marker for; anything unrecogn
 - A streamed plugin needs `KONG_UNTRUSTED_LUA` set to `lax` or `on`.
 - The delivery mode is node-wide, not per-route.
 - `streaming` cannot stop a tool before it runs; `buffered` makes time to first token the completion time.
+- A handler delivered by the control plane cannot score answers in `streaming` mode where the sandbox allows no timers. Use `buffered` there, or install the plugin on the data plane.
 - Running behind `ai-proxy` means this plugin sees the request AFTER any AI Proxy rewrite — see [AI Proxy](#ai-proxy).
 - Buffered responses spill to an nginx temp file on disk when they exceed the proxy buffers. That is model output at rest on the data plane; size `proxy_max_temp_file_size` and treat the node's filesystem accordingly.
 - Synchronous scoring adds a latency budget (default 8 s timeout, typically much faster).
