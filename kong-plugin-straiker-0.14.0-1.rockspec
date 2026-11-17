@@ -1,5 +1,5 @@
 package = "kong-plugin-straiker"
-version = "0.13.0-1"
+version = "0.14.0-1"
 supported_platforms = { "linux", "macosx" }
 source = {
    url = "file://./",
@@ -44,6 +44,18 @@ tools/check-plugin-layout.sh enforces it.
 
 Enable with:
   KONG_PLUGINS=bundled,straiker
+
+v0.14.0 -- buffered mode holds streamed answers on Kong AI Gateway 2.2 and
+later. That runtime turns response buffering off for a streamed request after
+this plugin has been collected, so on 0.13.0 a streamed answer behind a Model
+or an AI proxy was passed through unscored with x-straiker-verdict: allow. The
+access handler now requests buffering itself. The plugin also runs as a handler
+delivered by the control plane (for example a Konnect custom policy of type
+streaming): Kong's plugin sandbox has no os.getenv, setmetatable or timers, and
+0.13.0 failed to load there. The mode is read through the env vault when the
+environment cannot be read, empty lists are left out of the log record, and
+streaming mode skips the answer relay with a warning where timers are missing.
+An installed plugin on Kong Gateway 3.x is unchanged. No config changes.
 
 v0.13.0 -- Straiker's turn details go on Kong's log record (straiker.session_id,
 then straiker.request and straiker.response: action, turn_id, controls,

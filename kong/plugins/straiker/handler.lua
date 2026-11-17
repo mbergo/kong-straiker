@@ -56,6 +56,13 @@ local http  = require "resty.http"
 --            `response` runs. Measured: request + `response-sync`, and the
 --            captured body is still the client's own Anthropic request.
 --
+-- Kong AI Gateway 2.2+ moved that clear out of ai-proxy's access handler into a
+-- deferred flush, which runs when iteration first drops below the lowest AI plugin
+-- priority (765 in 2.2.0). That point is this plugin, after it has been collected,
+-- so being below 770 is no longer sufficient there and `access` also calls
+-- `enable_buffering()` itself. 760 still matters: above the lowest AI priority the
+-- flush would run after our access and clear the flag for good.
+--
 -- Still far below Kong auth (key-auth 1250, jwt 1450), so the Consumer is
 -- resolved before `access` and attribution is unaffected.
 --
@@ -73,10 +80,38 @@ local http  = require "resty.http"
 -- a captured request and a captured relay. A provider where ai-proxy genuinely
 -- reshapes the traffic would hand us its translation on both halves. If the raw
 -- client bytes must be guaranteed, keep ai-proxy off that route.
-local Straiker = { PRIORITY = 760, VERSION = "0.13.0" }
+local Straiker = { PRIORITY = 760, VERSION = "0.14.0" }
+
+-- ⚠️ **Kong's plugin sandbox is an allowlist, and two things this file used are not
+-- on it.** A handler delivered by the control plane (a Konnect custom policy of type
+-- `streaming`, or a Dedicated Cloud Gateway upload) runs inside that sandbox. There
+-- `os.getenv` and `setmetatable` are both nil: the first made the handler fail to
+-- load, which rejects the whole config and 404s the route, and the second failed every
+-- request with a 500. An installed copy (rock, image, mounted directory) is not
+-- sandboxed and sees both.
+local getenv = os and os.getenv
+local setmt  = setmetatable
+-- A third limit of the same sandbox: it allows no timers, so `ngx.timer` is nil there.
+-- The `streaming` relay is built on one. See `Straiker:log`.
+local timer_at = ngx.timer and ngx.timer.at
+local relay_warned = false
 
 -- Read ONCE, at module load. See the header for why this cannot be config.
-local MODE = os.getenv("STRAIKER_KONG_MODE")
+--
+-- A sandboxed copy cannot read the environment directly, but Kong's vault API is on
+-- the allowlist and its `env` vault can. A delivered handler is loaded in the worker,
+-- and nginx clears the worker's environment, so the variable must also be named in
+-- `KONG_NGINX_MAIN_ENV` to be visible there. With neither source the mode is buffered.
+local function read_mode()
+  local mode = getenv and getenv("STRAIKER_KONG_MODE")
+  if mode and mode ~= "" then return mode end
+  local ok, value = pcall(function()
+    return kong.vault.get("{vault://env/straiker-kong-mode}")
+  end)
+  if ok and type(value) == "string" and value ~= "" then return value end
+end
+
+local MODE = read_mode()
 if MODE ~= "streaming" then MODE = "buffered" end
 
 local VERDICT_HEADER = "x-straiker-verdict"
@@ -100,7 +135,7 @@ local PHASE_STREAMING = "response"
 
 -- cjson encodes an empty Lua table as {}; Anthropic sends "content": [].
 local EMPTY_ARRAY = cjson.empty_array
-                    or (cjson.array_mt and setmetatable({}, cjson.array_mt))
+                    or (cjson.array_mt and setmt and setmt({}, cjson.array_mt))
                     or {}
 
 -- No name prefix: Kong already stamps `[straiker]` on every line, and adding
@@ -486,7 +521,16 @@ local function plain(v)
   local out = {}
   for i, item in ipairs(v) do out[i] = plain(item) end
   -- Keeps an empty list encoding as [] rather than {}.
-  if #out == 0 and cjson.array_mt then setmetatable(out, cjson.array_mt) end
+  --
+  -- Marking it needs `setmetatable`, which a sandboxed copy does not have. There the
+  -- empty list is left OUT of the record instead: an absent key is easier on a log
+  -- pipeline than a field that is an array on one node and an object on another.
+  -- `cjson.empty_array` is not a way round it. It is userdata, and Kong's log
+  -- serializer rejects the whole record, failing the log phase.
+  if #out == 0 then
+    if not (setmt and cjson.array_mt) then return nil end
+    setmt(out, cjson.array_mt)
+  end
   return out
 end
 
@@ -539,6 +583,21 @@ end
 
 function Straiker:access(conf)
   local ctx = ngx.ctx
+
+  -- ⚠️ **Ask for buffering here; do not rely on `response` existing.** Kong sets the
+  -- flag when it COLLECTS a plugin that declares `response`, and an AI proxy on the
+  -- same route clears it again once it has seen `stream: true`. On Kong Gateway 3.x
+  -- that clear happens inside ai-proxy's own access handler, so being collected after
+  -- it (PRIORITY 760) was enough. Kong AI Gateway 2.2+ defers the clear to a pipeline
+  -- flush that runs AFTER this plugin is collected and just before this handler, so
+  -- collection order no longer restores it: `response` never ran, the answer was never
+  -- scored, and the client still got a 200 with an `allow` verdict.
+  --
+  -- This call lands after that flush, which makes it the last word on the flag. It is
+  -- the FIRST thing access does so that no early return below can skip it.
+  if MODE == "buffered" and conf.score_response then
+    kong.service.request.enable_buffering()
+  end
 
   -- ⚠️ **THE MOST EXPENSIVE BUG THIS PLUGIN CAN HAVE, and it is one line.**
   -- Buffering does NOT decompress. With `Accept-Encoding: gzip` -- which every SDK
@@ -628,9 +687,6 @@ function Straiker:access(conf)
     kong.log.warn(string.format("preamble shape=%s lead=%q", shape,
                                 string.sub(tostring(sys or ""), 1, 150)))
   end
-
-  -- Not needed in buffered mode: implementing `response` makes Kong buffer on its
-  -- own. Calling it anyway would be harmless but would imply the phase is optional.
 
   -- Everything above is state the RESPONSE half needs, so it runs either way.
   -- Only the prompt's own scoring call is skipped here.
@@ -731,6 +787,8 @@ else
   -- Tokens pass through; the verdict is advisory and says so.
   function Straiker:body_filter(conf)
     if not conf.score_response then return end
+    -- No timer means no relay, so there is nothing to collect the answer for.
+    if not timer_at then return end
     local ctx = ngx.ctx
     if ctx.straiker_denied then return end
     if ctx.straiker_skip_relay then return end
@@ -772,6 +830,21 @@ else
 
   function Straiker:log(conf)
     if not conf.score_response then return end
+    -- ⚠️ **A sandboxed copy in `streaming` mode cannot score answers at all.** The relay
+    -- has to leave the log phase to reach Straiker, because `log_by_lua` forbids
+    -- cosockets, and a timer is the only way out. Indexing the missing `ngx.timer`
+    -- raised here and failed the whole log phase on every request. Say so once per
+    -- worker and stand down: prompts and tool results are still enforced in `access`.
+    if not timer_at then
+      if not relay_warned then
+        relay_warned = true
+        log_warn("streaming mode cannot score answers in this install: the handler was "
+                 .. "delivered by the control plane and Kong's plugin sandbox allows no "
+                 .. "timers. Prompts and tool results are still enforced. Install the "
+                 .. "plugin on the data plane, or use buffered mode, to score answers.")
+      end
+      return
+    end
     local ctx = ngx.ctx
     if ctx.straiker_denied or ctx.straiker_skip_relay then return end
     if not ctx.straiker_chunks then return end
@@ -788,7 +861,7 @@ else
     -- Deferring by zero seconds moves the call into a timer context where sockets
     -- work. This is also why the buffered shape cannot simply live here instead:
     -- by the time a timer runs, the answer has long since left.
-    local ok, err = ngx.timer.at(0, function(premature)
+    local ok, err = timer_at(0, function(premature)
       if premature then return end
       local verdict, serr = score(conf, payload, cc_session)
       if not verdict then
