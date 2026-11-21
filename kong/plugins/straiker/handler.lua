@@ -641,20 +641,6 @@ function Straiker:access(conf)
   -- EITHER half is scored; only the scoring call itself is gated, further down.
   if not (conf.score_request or conf.score_response) then return end
 
-  -- Nothing to score on a bodiless GET. The Claude desktop app probes
-  -- `GET /v1/models` before it will accept a gateway at all, and without this that
-  -- probe logged a warning about a missing body on every discovery call -- noise
-  -- that would bury the real one below.
-  --
-  -- ⚠️ **Skip on "no body", not on "not POST".** This used to return for every
-  -- method but POST, so a PUT or PATCH carrying a prompt reached the model with no
-  -- check and no `fail_closed`. Any request that carries a body is read and scored.
-  if kong.request.get_method() ~= "POST" then
-    local length = tonumber(kong.request.get_header("content-length"))
-    local chunked = kong.request.get_header("transfer-encoding")
-    if not chunked and (not length or length <= 0) then return end
-  end
-
   -- ⚠️ **The argument is the difference between reading a big body and silently
   -- not inspecting it.** Bare `get_raw_body()` returns nil the moment nginx spills
   -- the body to a temp file -- which it does above `client_body_buffer_size`, only
@@ -664,6 +650,19 @@ function Straiker:access(conf)
   -- yield between them. Bounded by the same `max_body_bytes` the scorer uses, so
   -- one setting governs both and we never read something we would then refuse.
   local raw, body_err = kong.request.get_raw_body(conf.max_body_bytes)
+
+  -- Nothing to score on a bodiless GET. The Claude desktop app probes
+  -- `GET /v1/models` before it will accept a gateway at all, and without this that
+  -- probe logged a warning about a missing body on every discovery call -- noise
+  -- that would bury the real one below.
+  --
+  -- ⚠️ **Skip on "no body", not on "not POST", and decide by reading it.** This
+  -- used to return for every method but POST, so a PUT or PATCH carrying a prompt
+  -- reached the model with no check and no `fail_closed`. Framing headers are not
+  -- a substitute: HTTP/2 carries a body with neither Content-Length nor
+  -- Transfer-Encoding.
+  if raw == "" and kong.request.get_method() ~= "POST" then return end
+
   if not raw or raw == "" then
     -- Reaching here now means genuinely unreadable or over the cap, not merely
     -- large. That is an UNSCORED request, so it answers to `fail_closed` like any
