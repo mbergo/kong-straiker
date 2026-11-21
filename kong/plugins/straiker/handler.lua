@@ -570,6 +570,9 @@ local function degraded(conf, phase, err, model, streaming)
   log_warn("%s scoring failed: %s", phase, err or "unknown")
   record(phase, "degraded")
   if conf.fail_closed then
+    -- The denial is a synthetic 200; without this the streaming relay would
+    -- submit it to Straiker as the model's answer.
+    ngx.ctx.straiker_denied = true
     return deny("Straiker is unreachable and this gateway is fail-closed.",
                 model, streaming)
   end
