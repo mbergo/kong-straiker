@@ -564,6 +564,15 @@ local function stamp(label)
   kong.response.set_header(VERDICT_HEADER, label)
 end
 
+-- The body that failed to parse cannot say whether the client streams, but the
+-- denial still has to match what it asked for. The upstream's lenient parser
+-- would honour a `"stream": true` in those bytes, so look for it there.
+local function wants_stream(raw)
+  if raw and raw:find('"stream"%s*:%s*true') then return true end
+  local accept = kong.request.get_header("accept")
+  return type(accept) == "string" and accept:find("text/event-stream", 1, true) ~= nil
+end
+
 -- A degraded control must stay visible. Silence here is what makes an outage look
 -- like a clean allow, which is the failure this whole artifact exists to catch.
 local function degraded(conf, phase, err, model, streaming)
@@ -669,7 +678,8 @@ function Straiker:access(conf)
     -- other degraded check rather than quietly proxying -- which is what it used
     -- to do, in the one case where the body was too big to be boring.
     return degraded(conf, "request",
-                    "unreadable body (" .. (body_err or "empty body") .. ")", nil, false)
+                    "unreadable body (" .. (body_err or "empty body") .. ")", nil,
+                    wants_stream(raw))
   end
 
   -- ⚠️ **A body this parser rejects is an UNSCORED request, not a boring one.**
@@ -677,13 +687,12 @@ function Straiker:access(conf)
   -- parser: lone surrogates, UTF-16, deeper nesting. Quietly forwarding here let a
   -- prompt reach the model uninspected even on a fail-closed gateway, so it answers
   -- to `fail_closed` and stamps `degraded` like every other unscored path.
+  --
+  -- Either half counts: with only `score_response` on, the answer would otherwise
+  -- be scored with no request to classify it against.
   local req = cjson.decode(raw)
   if type(req) ~= "table" then
-    if conf.score_request then
-      return degraded(conf, "request", "body is not a JSON object", nil, false)
-    end
-    log_warn("request body is not JSON; forwarding unscored")
-    return
+    return degraded(conf, "request", "body is not a JSON object", nil, wants_stream(raw))
   end
 
   -- Kept for the response phase and for the denial's shape. `stream` decides
@@ -768,6 +777,9 @@ if MODE == "buffered" then
     -- A pre-call block still runs the later phases, so without this Straiker would
     -- see two turns for a request that never reached the model.
     if ctx.straiker_denied then return end
+    -- No parsed request (bodiless, unreadable or unparseable): the answer would be
+    -- classified against nothing, and access already stamped what happened.
+    if not ctx.straiker_request then return end
 
     -- ⚠️ **An upstream ERROR is not the model's answer.** Without this a 400, 401, 429 or
     -- 502 has its error JSON posted as `sse` and scored as though the model had said it.
@@ -810,6 +822,7 @@ else
     local ctx = ngx.ctx
     if ctx.straiker_denied then return end
     if ctx.straiker_skip_relay then return end
+    if not ctx.straiker_request then return end
 
     -- ⚠️ **An upstream ERROR is not the model's answer, and this half had no such
     -- check while the buffered half did.** Without it a 400, 401, 429 or 502 has
