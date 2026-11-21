@@ -638,11 +638,19 @@ function Straiker:access(conf)
   -- EITHER half is scored; only the scoring call itself is gated, further down.
   if not (conf.score_request or conf.score_response) then return end
 
-  -- Nothing to score on a GET. The Claude desktop app probes `GET /v1/models` before
-  -- it will accept a gateway at all, and without this that probe logged a warning
-  -- about a missing body on every discovery call -- noise that would bury the real
-  -- one below.
-  if kong.request.get_method() ~= "POST" then return end
+  -- Nothing to score on a bodiless GET. The Claude desktop app probes
+  -- `GET /v1/models` before it will accept a gateway at all, and without this that
+  -- probe logged a warning about a missing body on every discovery call -- noise
+  -- that would bury the real one below.
+  --
+  -- ⚠️ **Skip on "no body", not on "not POST".** This used to return for every
+  -- method but POST, so a PUT or PATCH carrying a prompt reached the model with no
+  -- check and no `fail_closed`. Any request that carries a body is read and scored.
+  if kong.request.get_method() ~= "POST" then
+    local length = tonumber(kong.request.get_header("content-length"))
+    local chunked = kong.request.get_header("transfer-encoding")
+    if not chunked and (not length or length <= 0) then return end
+  end
 
   -- ⚠️ **The argument is the difference between reading a big body and silently
   -- not inspecting it.** Bare `get_raw_body()` returns nil the moment nginx spills
@@ -662,8 +670,16 @@ function Straiker:access(conf)
                     "unreadable body (" .. (body_err or "empty body") .. ")", nil, false)
   end
 
+  -- ⚠️ **A body this parser rejects is an UNSCORED request, not a boring one.**
+  -- The upstream parses the original bytes with its own, often more lenient,
+  -- parser: lone surrogates, UTF-16, deeper nesting. Quietly forwarding here let a
+  -- prompt reach the model uninspected even on a fail-closed gateway, so it answers
+  -- to `fail_closed` and stamps `degraded` like every other unscored path.
   local req = cjson.decode(raw)
   if type(req) ~= "table" then
+    if conf.score_request then
+      return degraded(conf, "request", "body is not a JSON object", nil, false)
+    end
     log_warn("request body is not JSON; forwarding unscored")
     return
   end
