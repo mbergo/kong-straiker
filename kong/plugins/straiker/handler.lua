@@ -276,17 +276,32 @@ local function acting_user(conf)
   return conf.user_ref
 end
 
+-- ⚠️ **Both fields are always overwritten, never left to the payload.** The prompt
+-- payload starts as a copy of the client's body, so a field this function skipped
+-- would carry whatever the caller put there -- `original.processed.Meta.user` on an
+-- unauthenticated route is the same attack as the header fallback refused above.
 local function with_identity(conf, ctx, payload)
-  if ctx.straiker_session then payload.session_id = ctx.straiker_session end
+  payload.session_id = ctx.straiker_session
   local user = acting_user(conf)
-  if user then
-    -- The one place Straiker looks for a user on a relayed request: v3 has no user
-    -- header at all, so the body is the only place a caller can name one. Without it
-    -- turns are attributed to nobody.
-    payload.original = { processed = { Meta = { user = user } } }
-  end
+  -- The one place Straiker looks for a user on a relayed request: v3 has no user
+  -- header at all, so the body is the only place a caller can name one. Without it
+  -- turns are attributed to nobody.
+  payload.original = user and { processed = { Meta = { user = user } } } or nil
   return payload
 end
+
+-- Top-level keys the plugin owns in a Detect payload: the answer envelope and the
+-- identity fields. A prompt body carrying any of them is the caller writing the
+-- plugin's control fields -- `straiker_phase` alone turns an enforced prompt check
+-- into an advisory record, and `sse` / `request` replace what is scored. They are
+-- stripped from the scored copy only; the body forwarded upstream is untouched.
+local RESERVED_DETECT_KEYS = {
+  straiker_phase = true,
+  sse            = true,
+  request        = true,
+  original       = true,
+  session_id     = true,
+}
 
 -- Every text block of a message, so a turn that opens with an image or a document
 -- still seeds on what the user wrote.
@@ -694,7 +709,9 @@ function Straiker:access(conf)
 
   -- A shallow copy: the enrichment must not reach the body Kong forwards upstream.
   local scored = {}
-  for k, v in pairs(req) do scored[k] = v end
+  for k, v in pairs(req) do
+    if not RESERVED_DETECT_KEYS[k] then scored[k] = v end
+  end
   local verdict, err = score(conf, with_identity(conf, ctx, scored),
                              ctx.straiker_cc_session)
   if not verdict then
